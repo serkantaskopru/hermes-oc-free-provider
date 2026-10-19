@@ -817,6 +817,52 @@ class ClientTests(unittest.TestCase):
             ):
                 self.assertEqual(client.OpenCodeClient().list_models(), ["last-free"])
 
+    def test_catalog_uses_live_free_tier_when_metadata_lags(self):
+        zen = {
+            "data": [
+                {"id": "glm-5.3-flash-free"},
+                {"id": "deepseek-v4.1-flash-free"},
+                {"id": "jev-1.13-free"},
+                {"id": "big-pickle"},
+                {"id": "test"},
+                {"id": "paid-model"},
+            ]
+        }
+        catalog = {
+            "opencode": {
+                "models": {
+                    "big-pickle": {"tool_call": True, "cost": {"input": 0, "output": 0}},
+                    "paid-model": {"tool_call": True, "cost": {"input": 1, "output": 0}},
+                }
+            }
+        }
+        self.assertEqual(
+            client._free_live_models(zen, catalog),
+            ["big-pickle", "deepseek-v4.1-flash-free", "glm-5.3-flash-free", "jev-1.13-free"],
+        )
+
+    def test_catalog_excludes_deprecated_and_non_tool_free_models(self):
+        zen = {
+            "data": [
+                {"id": "muse-spark-1.3-contributor-free"},
+                {"id": "no-tools-free"},
+                {"id": "ok-free"},
+            ]
+        }
+        catalog = {
+            "opencode": {
+                "models": {
+                    "muse-spark-1.3-contributor-free": {
+                        "tool_call": True,
+                        "status": "deprecated",
+                        "cost": {"input": 0, "output": 0},
+                    },
+                    "no-tools-free": {"tool_call": False, "cost": {"input": 0, "output": 0}},
+                }
+            }
+        }
+        self.assertEqual(client._free_live_models(zen, catalog), ["ok-free"])
+
 
 if __name__ == "__main__":
     unittest.main()

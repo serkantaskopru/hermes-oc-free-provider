@@ -101,14 +101,17 @@ hermes model
 
 ## Model discovery
 
-The plugin intersects OpenCode Zen's live `/v1/models` response with the
-OpenCode catalog metadata published by [models.dev](https://models.dev/). It
-exposes only live, tool-capable models whose published input/output/cache costs
-are all zero. The resulting intersection—not the full upstream responses—is
+OpenCode Zen's live `/v1/models` response is the authoritative catalog: every
+advertised model whose id ends in `-free` is exposed, even when
+[models.dev](https://models.dev/) has not published it yet. models.dev metadata
+is consulted when available to exclude deprecated models, drop models without
+tool calling, and include zero-cost models that do not carry the `-free` suffix
+(such as `big-pickle`). Ids the relay still lists but no longer serves are
+excluded explicitly. The resulting list—not the full upstream response—is
 cached for the gateway process and persisted under the active Hermes profile.
 Each new gateway process queries both endpoints once; if refresh fails or finds
-no qualifying model, the plugin uses the last successful intersection, then
-the verified entries bundled with it when no cache exists. It selects
+no qualifying model, the plugin uses the last successful list, then the
+verified entries bundled with it when no cache exists. It selects
 `/chat/completions` or `/responses` according to the known model transport.
 
 Model availability, pricing, retention, and data-use rules belong to OpenCode

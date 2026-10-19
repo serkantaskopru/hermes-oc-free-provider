@@ -31,13 +31,27 @@ OPENCODE_USER_AGENT = f"opencode/{OPENCODE_VERSION}"
 DEFAULT_MODEL = "big-pickle"
 FALLBACK_MODELS = (
     DEFAULT_MODEL,
-    "ling-3.0-flash-fin-free",
-    "mimo-v2.5-free",
-    "muse-spark-1.2-contributor-free",
-    "muse-spark-1.3-contributor-free",
-    "nemotron-3-ultra-free",
+    "glm-5.3-flash-free",
+    "deepseek-v4.1-flash-free",
+    "mimo-v2.6-flash-free",
+    "nemotron-3.5-super-vl-free",
     "nemotron-3.5-lightning-free",
+    "longcat-2.5-preview-free",
+    "beam-free",
+    "space-bunny-free",
+    "jev-1.13-free",
 )
+# Models the relay still lists but no longer serves (or that are not models at
+# all). Keep in sync with Hermes' opencode-free exclusion list.
+EXCLUDED_MODELS = frozenset(
+    {
+        "test",
+        "ox-alpha-free",
+        "deepseek-v4-flash-free",
+    }
+)
+# Deprecated free tier only; kept so the /responses adapter stays covered, but
+# these ids are no longer discovered or advertised as fallbacks.
 RESPONSES_MODELS = frozenset(
     {
         "muse-spark-1.2-contributor-free",
@@ -245,6 +259,14 @@ def _json_get(url: str, timeout: float) -> Any:
 
 
 def _free_live_models(zen: Any, catalog: Any) -> list[str]:
+    """Free models advertised by the Zen relay that support tool calling.
+
+    The relay's own ``/v1/models`` response is authoritative for availability.
+    A ``-free`` suffix is enough to qualify, so newly launched free models show
+    up even before models.dev catches up. models.dev metadata is consulted when
+    present: it excludes deprecated models, requires zero cost for ids without
+    the suffix (e.g. ``big-pickle``), and drops non-tool models.
+    """
     zen_models = {
         str(item.get("id") or "")
         for item in (zen.get("data") if isinstance(zen, dict) else []) or []
@@ -253,17 +275,29 @@ def _free_live_models(zen: Any, catalog: Any) -> list[str]:
     provider = catalog.get("opencode") if isinstance(catalog, dict) else None
     metadata = provider.get("models") if isinstance(provider, dict) else None
     if not isinstance(metadata, dict):
-        return []
+        metadata = {}
 
     free = []
-    for model, details in metadata.items():
-        if not isinstance(details, dict) or details.get("status") == "deprecated":
+    for model in sorted(zen_models):
+        lowered = model.lower()
+        if not lowered or lowered in EXCLUDED_MODELS:
+            continue
+        details = metadata.get(model)
+        if not isinstance(details, dict):
+            # No models.dev entry (yet): trust the relay's free-tier naming.
+            if lowered.endswith("-free"):
+                free.append(model)
+            continue
+        if details.get("status") == "deprecated":
+            continue
+        if details.get("tool_call") is not True:
+            continue
+        if lowered.endswith("-free"):
+            free.append(model)
             continue
         costs = details.get("cost")
         if (
-            model in zen_models
-            and details.get("tool_call") is True
-            and isinstance(costs, dict)
+            isinstance(costs, dict)
             and costs
             and all(
                 isinstance(cost, (int, float))
@@ -272,8 +306,8 @@ def _free_live_models(zen: Any, catalog: Any) -> list[str]:
                 for cost in costs.values()
             )
         ):
-            free.append(str(model))
-    return sorted(free)
+            free.append(model)
+    return free
 
 
 def _model_cache_path() -> Path:
