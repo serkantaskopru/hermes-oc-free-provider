@@ -107,12 +107,22 @@ advertised model whose id ends in `-free` is exposed, even when
 is consulted when available to exclude deprecated models, drop models without
 tool calling, and include zero-cost models that do not carry the `-free` suffix
 (such as `big-pickle`). Ids the relay still lists but no longer serves are
-excluded explicitly. The resulting list—not the full upstream response—is
-cached for the gateway process and persisted under the active Hermes profile.
-Each new gateway process queries both endpoints once; if refresh fails or finds
-no qualifying model, the plugin uses the last successful list, then the
-verified entries bundled with it when no cache exists. It selects
-`/chat/completions` or `/responses` according to the known model transport.
+excluded explicitly. It selects `/chat/completions` or `/responses` according to
+the known model transport.
+
+The catalog is re-read while the process runs: the relay's list is refreshed at
+most every 10 minutes, models.dev metadata every 6 hours (it is a
+multi-megabyte payload). A gateway process that lived for days would otherwise
+keep serving the catalog it read at start-up. The discovered list is persisted
+under the active Hermes profile and used when a refresh fails; that persisted
+copy is dropped after a week. The bundled list is the last resort, used before
+the first successful discovery or while the relay is unreachable.
+
+Hermes shows a provider's curated floor (`fallback_models`) merged with its
+live list, so the plugin pins the floor to the last discovered catalog: a
+static floor would keep retired ids in the picker and hide newly launched free
+models. The picker therefore lists exactly the free ids the relay currently
+serves.
 
 Model availability, pricing, retention, and data-use rules belong to OpenCode
 and the underlying provider and can change independently of this repository.

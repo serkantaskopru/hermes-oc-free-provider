@@ -25,10 +25,23 @@ DIRECT_URL = "https://opencode.ai/zen/v1/chat/completions"
 RESPONSES_URL = "https://opencode.ai/zen/v1/responses"
 ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models"
 MODELS_DEV_URL = "https://models.dev/api.json"
+# The relay's catalog changes on release timescales. The in-process snapshot is
+# refreshed once it is older than this, so a long-lived gateway never keeps
+# serving the catalog it read at start-up.
+MODEL_SNAPSHOT_TTL = 600.0
+# models.dev is a multi-megabyte payload: refresh its metadata far less often
+# than the relay's own catalog.
+METADATA_SNAPSHOT_TTL = 6 * 3600.0
+# The persisted catalog is the offline fallback. Keep it only while it still
+# describes the relay's current free tier.
+MODEL_CACHE_MAX_AGE = 7 * 24 * 3600.0
 LOGICAL_BASE_URL = DIRECT_URL
 OPENCODE_VERSION = "1.18.31"
 OPENCODE_USER_AGENT = f"opencode/{OPENCODE_VERSION}"
 DEFAULT_MODEL = "big-pickle"
+# Offline floor: the free models the relay served when this release shipped. It
+# only matters before the first successful discovery (or while the relay is
+# unreachable); every successful discovery replaces it.
 FALLBACK_MODELS = (
     DEFAULT_MODEL,
     "glm-5.3-flash-free",
@@ -38,8 +51,8 @@ FALLBACK_MODELS = (
     "nemotron-3.5-lightning-free",
     "longcat-2.5-preview-free",
     "beam-free",
-    "space-bunny-free",
     "jev-1.13-free",
+    "minimax-m3.1-flash-free",
 )
 # Models the relay still lists but no longer serves (or that are not models at
 # all). Keep in sync with Hermes' opencode-free exclusion list.
@@ -222,7 +235,11 @@ _BASE62 = string.digits + string.ascii_letters
 _SESSION_LOCK = threading.Lock()
 _SESSION_COUNTER = 0
 _MODEL_SNAPSHOT: tuple[str, ...] | None = None
+_MODEL_SNAPSHOT_AT = 0.0
 _MODEL_SNAPSHOT_LOCK = threading.Lock()
+_METADATA_SNAPSHOT: dict[str, Any] | None = None
+_METADATA_SNAPSHOT_AT = 0.0
+_METADATA_SNAPSHOT_LOCK = threading.Lock()
 
 
 class OpenCodeError(RuntimeError):
@@ -315,8 +332,11 @@ def _model_cache_path() -> Path:
 
 
 def _load_model_cache() -> list[str]:
+    path = _model_cache_path()
     try:
-        models = json.loads(_model_cache_path().read_text(encoding="utf-8"))
+        if time.time() - path.stat().st_mtime > MODEL_CACHE_MAX_AGE:
+            return []
+        models = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
     if not isinstance(models, list) or any(
@@ -340,23 +360,82 @@ def _save_model_cache(models: list[str]) -> None:
             pass
 
 
-def _models_for_process(timeout: float) -> tuple[str, ...]:
-    global _MODEL_SNAPSHOT
-    with _MODEL_SNAPSHOT_LOCK:
-        if _MODEL_SNAPSHOT is None:
+def _models_dev_metadata(timeout: float) -> dict[str, Any]:
+    """models.dev metadata, refreshed rarely (multi-megabyte payload).
+
+    A failed refresh keeps the last good copy: the relay's own catalog is
+    authoritative for availability, models.dev only refines it.
+    """
+    global _METADATA_SNAPSHOT, _METADATA_SNAPSHOT_AT
+    with _METADATA_SNAPSHOT_LOCK:
+        now = time.monotonic()
+        if (
+            _METADATA_SNAPSHOT is None
+            or now - _METADATA_SNAPSHOT_AT >= METADATA_SNAPSHOT_TTL
+        ):
             try:
-                models = _free_live_models(
-                    _json_get(ZEN_MODELS_URL, timeout),
-                    _json_get(MODELS_DEV_URL, timeout),
-                )
+                catalog = _json_get(MODELS_DEV_URL, max(timeout, 30.0))
             except (OSError, ValueError, urllib.error.URLError):
-                models = []
-            if models:
-                _save_model_cache(models)
-            else:
-                models = _load_model_cache() or list(FALLBACK_MODELS)
-            _MODEL_SNAPSHOT = tuple(models)
+                catalog = None
+            if isinstance(catalog, dict):
+                _METADATA_SNAPSHOT = catalog
+                _METADATA_SNAPSHOT_AT = now
+            elif _METADATA_SNAPSHOT is None:
+                _METADATA_SNAPSHOT = {}
+                _METADATA_SNAPSHOT_AT = now
+        return _METADATA_SNAPSHOT or {}
+
+
+def _discover_models(timeout: float) -> list[str]:
+    """Live free-model catalog: the relay first, models.dev as the refinement."""
+    try:
+        models = _free_live_models(
+            _json_get(ZEN_MODELS_URL, timeout),
+            _models_dev_metadata(timeout),
+        )
+    except (OSError, ValueError, urllib.error.URLError):
+        models = []
+    if models:
+        _save_model_cache(models)
+        return models
+    return _load_model_cache() or list(FALLBACK_MODELS)
+
+
+def _models_for_process(timeout: float) -> tuple[str, ...]:
+    """Catalog for this process, refreshed once the snapshot goes stale.
+
+    A gateway process lives for days; a snapshot taken at start-up would keep
+    the picker on a catalog the relay retired hours ago.
+    """
+    global _MODEL_SNAPSHOT, _MODEL_SNAPSHOT_AT
+    with _MODEL_SNAPSHOT_LOCK:
+        now = time.monotonic()
+        if (
+            _MODEL_SNAPSHOT is None
+            or now - _MODEL_SNAPSHOT_AT >= MODEL_SNAPSHOT_TTL
+        ):
+            _MODEL_SNAPSHOT = tuple(_discover_models(timeout))
+            _MODEL_SNAPSHOT_AT = now
         return _MODEL_SNAPSHOT
+
+
+def sync_profile_catalog(profile: Any, models: list[str]) -> tuple[str, ...]:
+    """Pin a provider profile's curated floor to the catalog just discovered.
+
+    Hermes shows a provider's ``fallback_models`` (its curated floor) merged
+    with the live list, so a floor that is not the live catalog keeps retired
+    ids in the picker and hides newly launched ones. Pinning the floor to the
+    last discovery makes the picker list exactly the ids the relay serves.
+    """
+    discovered = tuple(dict.fromkeys(str(model) for model in models if model))
+    if not discovered:
+        return ()
+    profile.fallback_models = discovered
+    capabilities = dict(getattr(profile, "model_capabilities", None) or {})
+    for model in discovered:
+        capabilities.setdefault(model, {"supports_tools": True})
+    profile.model_capabilities = capabilities
+    return discovered
 
 
 def _session_id() -> str:

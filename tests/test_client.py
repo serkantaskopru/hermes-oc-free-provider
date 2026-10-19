@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -786,6 +788,9 @@ class ClientTests(unittest.TestCase):
             cache = Path(directory) / "models.json"
             with (
                 mock.patch.object(client, "_MODEL_SNAPSHOT", None),
+                mock.patch.object(client, "_MODEL_SNAPSHOT_AT", 0.0),
+                mock.patch.object(client, "_METADATA_SNAPSHOT", None),
+                mock.patch.object(client, "_METADATA_SNAPSHOT_AT", 0.0),
                 mock.patch.object(client, "_model_cache_path", return_value=cache),
                 mock.patch.object(client, "_urlopen", side_effect=responses) as opened,
             ):
@@ -862,6 +867,82 @@ class ClientTests(unittest.TestCase):
             }
         }
         self.assertEqual(client._free_live_models(zen, catalog), ["ok-free"])
+
+    def test_catalog_is_re_read_once_the_snapshot_goes_stale(self):
+        """A long-lived gateway must not keep serving its start-up catalog."""
+        responses = [
+            FakeResponse(body=json.dumps({"data": [{"id": "first-free"}]}).encode()),
+            FakeResponse(body=json.dumps({}).encode()),
+            FakeResponse(body=json.dumps({"data": [{"id": "second-free"}]}).encode()),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "models.json"
+            with (
+                mock.patch.object(client, "_MODEL_SNAPSHOT", None),
+                mock.patch.object(client, "_MODEL_SNAPSHOT_AT", 0.0),
+                mock.patch.object(client, "_METADATA_SNAPSHOT", None),
+                mock.patch.object(client, "_METADATA_SNAPSHOT_AT", 0.0),
+                mock.patch.object(client, "_model_cache_path", return_value=cache),
+                mock.patch.object(client, "_urlopen", side_effect=responses) as opened,
+            ):
+                oc = client.OpenCodeClient()
+                self.assertEqual(oc.list_models(), ["first-free"])
+                self.assertEqual(oc.list_models(), ["first-free"])
+                self.assertEqual(len(opened.call_args_list), 2)
+                with mock.patch.object(client, "MODEL_SNAPSHOT_TTL", 0.0):
+                    self.assertEqual(oc.list_models(), ["second-free"])
+                # The stale snapshot is replaced, not appended to.
+                self.assertEqual(
+                    json.loads(cache.read_text()), ["second-free"]
+                )
+        # Only the relay's catalog is re-read; models.dev is refreshed rarely.
+        self.assertEqual(
+            [call.args[0].full_url for call in opened.call_args_list],
+            [client.ZEN_MODELS_URL, client.MODELS_DEV_URL, client.ZEN_MODELS_URL],
+        )
+
+    def test_expired_disk_cache_is_not_served(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "models.json"
+            cache.write_text('["stale-free"]')
+            expired = time.time() - client.MODEL_CACHE_MAX_AGE - 60
+            os.utime(cache, (expired, expired))
+            with (
+                mock.patch.object(client, "_MODEL_SNAPSHOT", None),
+                mock.patch.object(client, "_MODEL_SNAPSHOT_AT", 0.0),
+                mock.patch.object(client, "_METADATA_SNAPSHOT", None),
+                mock.patch.object(client, "_METADATA_SNAPSHOT_AT", 0.0),
+                mock.patch.object(client, "_model_cache_path", return_value=cache),
+                mock.patch.object(
+                    client, "_urlopen", side_effect=urllib.error.URLError("offline")
+                ),
+            ):
+                self.assertEqual(
+                    client.OpenCodeClient().list_models(),
+                    list(client.FALLBACK_MODELS),
+                )
+
+    def test_profile_floor_follows_the_discovered_catalog(self):
+        class Profile:
+            fallback_models = ("retired-free",)
+            model_capabilities = {"retired-free": {"supports_tools": True}}
+
+        profile = Profile()
+        discovered = client.sync_profile_catalog(profile, ["live-free", "live-free"])
+        self.assertEqual(profile.fallback_models, ("live-free",))
+        self.assertEqual(
+            profile.model_capabilities["live-free"], {"supports_tools": True}
+        )
+        self.assertEqual(discovered, ("live-free",))
+
+    def test_profile_floor_keeps_the_known_floor_when_nothing_was_discovered(self):
+        class Profile:
+            fallback_models = ("retired-free",)
+            model_capabilities = {}
+
+        profile = Profile()
+        self.assertEqual(client.sync_profile_catalog(profile, []), ())
+        self.assertEqual(profile.fallback_models, ("retired-free",))
 
 
 if __name__ == "__main__":
